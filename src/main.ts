@@ -5,19 +5,21 @@ import {
 	DEFAULT_SETTINGS,
 	EasyLocalBackupSettings,
 	EasyLocalBackupSettingTab,
+	validateDestination,
 } from "./settings";
 
 const PARTIAL_SUFFIX = ".partial";
 
 export default class EasyLocalBackupPlugin extends Plugin {
-	settings: EasyLocalBackupSettings;
-	private settingTab: EasyLocalBackupSettingTab;
+	settings!: EasyLocalBackupSettings;
+	private settingTab!: EasyLocalBackupSettingTab;
 	private running = false;
+	private abortController: AbortController | null = null;
 
 	async onload() {
 		await this.loadSettings();
 
-		this.addRibbonIcon("archive", "Create a local backup", () => {
+		this.addRibbonIcon("archive", "Easy Local Backup: back up vault", () => {
 			void this.runBackup();
 		});
 
@@ -31,6 +33,11 @@ export default class EasyLocalBackupPlugin extends Plugin {
 		this.addSettingTab(this.settingTab);
 	}
 
+	onunload() {
+		// Stop a running backup; it removes its own .partial folder as it exits.
+		this.abortController?.abort();
+	}
+
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
@@ -39,14 +46,20 @@ export default class EasyLocalBackupPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
+	/** Absolute path of the vault folder, or null if the vault isn't on the local file system. */
+	getVaultPath(): string | null {
+		const adapter = this.app.vault.adapter;
+		return adapter instanceof FileSystemAdapter ? adapter.getBasePath() : null;
+	}
+
 	async runBackup(): Promise<void> {
 		if (this.running) {
 			new Notice("A backup is already running.");
 			return;
 		}
 
-		const adapter = this.app.vault.adapter;
-		if (!(adapter instanceof FileSystemAdapter)) {
+		const vaultPath = this.getVaultPath();
+		if (!vaultPath) {
 			new Notice("Easy Local Backup only works with a local, file-based vault.");
 			return;
 		}
@@ -56,19 +69,19 @@ export default class EasyLocalBackupPlugin extends Plugin {
 			new Notice("Choose a backup destination in the Easy Local Backup settings first.");
 			return;
 		}
-		if (!path.isAbsolute(destRoot)) {
-			new Notice("The backup destination must be an absolute path.");
+		const problem = validateDestination(destRoot, vaultPath);
+		if (problem) {
+			new Notice(problem);
 			return;
 		}
 
-		const source = path.resolve(adapter.getBasePath());
+		const source = path.resolve(vaultPath);
 		const destination = path.resolve(destRoot);
-		if (isInside(source, destination)) {
-			new Notice("The backup destination can't be inside the vault. Pick a folder outside it.");
-			return;
-		}
 
 		this.running = true;
+		const abort = new AbortController();
+		this.abortController = abort;
+		const signal = abort.signal;
 		const progress = new Notice("Backing up vault…", 0);
 		let partialPath: string | null = null;
 
@@ -79,7 +92,7 @@ export default class EasyLocalBackupPlugin extends Plugin {
 			await removeStalePartials(destination, prefix);
 
 			// Abort early, with a clear message, if the destination can't hold the backup.
-			const needed = await dirSize(source);
+			const needed = await dirSize(source, signal);
 			const free = await freeSpace(destination);
 			if (free !== null && free < needed) {
 				throw new Error(
@@ -92,9 +105,10 @@ export default class EasyLocalBackupPlugin extends Plugin {
 			partialPath = finalPath + PARTIAL_SUFFIX;
 
 			// 1. Copy everything into the .partial folder.
-			const skipped = await copyDir(source, partialPath);
+			const skipped = await copyDir(source, partialPath, signal);
 
 			// 2. Only now does the backup become visible under its real name.
+			throwIfAborted(signal);
 			await fsp.rename(partialPath, finalPath);
 			partialPath = null;
 
@@ -110,23 +124,28 @@ export default class EasyLocalBackupPlugin extends Plugin {
 				8000
 			);
 		} catch (error) {
-			console.error("Easy Local Backup: backup failed", error);
 			progress.hide();
-			new Notice(`Backup failed: ${error instanceof Error ? error.message : String(error)}`, 10000);
+			if (signal.aborted) {
+				new Notice("Backup cancelled.");
+			} else {
+				console.error("Easy Local Backup: backup failed", error);
+				new Notice(
+					`Backup failed: ${error instanceof Error ? error.message : String(error)}`,
+					10000
+				);
+			}
 			if (partialPath) {
 				await fsp.rm(partialPath, { recursive: true, force: true }).catch(() => undefined);
 			}
 		} finally {
 			this.running = false;
+			this.abortController = null;
 		}
 	}
 }
 
-/** True if `child` is the same as, or located inside, `parent`. */
-function isInside(parent: string, child: string): boolean {
-	const rel = path.relative(parent, child);
-	if (rel === "") return true;
-	return rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
+function throwIfAborted(signal: AbortSignal): void {
+	if (signal.aborted) throw new Error("Backup cancelled.");
 }
 
 /** Makes a vault name safe to use inside a folder name on any OS. */
@@ -137,7 +156,7 @@ function sanitize(name: string): string {
 /** Local time as YYYY-MM-DD_HHmmss (no colons, so it is valid on Windows too). */
 function timestamp(): string {
 	const d = new Date();
-	const p = (n: number) => String(n).padStart(2, "0");
+	const p = (n: number) => ("0" + n).slice(-2);
 	return (
 		`${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_` +
 		`${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
@@ -173,12 +192,13 @@ async function removeStalePartials(dir: string, prefix: string): Promise<void> {
 }
 
 /** Total size in bytes of all regular files under dir (symlinks are ignored, as in copyDir). */
-async function dirSize(dir: string): Promise<number> {
+async function dirSize(dir: string, signal: AbortSignal): Promise<number> {
 	let total = 0;
 	for (const entry of await fsp.readdir(dir, { withFileTypes: true })) {
+		throwIfAborted(signal);
 		const full = path.join(dir, entry.name);
 		if (entry.isDirectory()) {
-			total += await dirSize(full);
+			total += await dirSize(full, signal);
 		} else if (entry.isFile()) {
 			total += (await fsp.stat(full)).size;
 		}
@@ -214,18 +234,21 @@ function formatBytes(bytes: number): string {
 
 /**
  * Recursively copies src into dest, preserving modification times.
+ * Stops (by throwing) as soon as the signal is aborted; a file already being
+ * copied finishes first.
  * Returns the number of entries skipped (symlinks and other special files).
  */
-async function copyDir(src: string, dest: string): Promise<number> {
+async function copyDir(src: string, dest: string, signal: AbortSignal): Promise<number> {
 	await fsp.mkdir(dest, { recursive: true });
 	let skipped = 0;
 
 	for (const entry of await fsp.readdir(src, { withFileTypes: true })) {
+		throwIfAborted(signal);
 		const from = path.join(src, entry.name);
 		const to = path.join(dest, entry.name);
 
 		if (entry.isDirectory()) {
-			skipped += await copyDir(from, to);
+			skipped += await copyDir(from, to, signal);
 		} else if (entry.isFile()) {
 			await fsp.copyFile(from, to);
 			const stat = await fsp.stat(from);
