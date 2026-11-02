@@ -19,7 +19,7 @@ export default class EasyLocalBackupPlugin extends Plugin {
 	async onload() {
 		await this.loadSettings();
 
-		this.addRibbonIcon("archive", "Easy Local Backup: back up vault", () => {
+		this.addRibbonIcon("archive", "Create new local backup", () => {
 			void this.runBackup();
 		});
 
