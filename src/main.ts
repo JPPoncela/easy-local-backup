@@ -1,114 +1,238 @@
-import {
-	Editor,
-	MarkdownView,
-	MarkdownFileInfo,
-	Modal,
-	Notice,
-	Plugin,
-} from 'obsidian';
+import { FileSystemAdapter, Notice, Plugin } from "obsidian";
+import { promises as fsp } from "fs";
+import * as path from "path";
 import {
 	DEFAULT_SETTINGS,
-	MyPluginSettings,
-	SampleSettingTab,
-} from './settings';
+	EasyLocalBackupSettings,
+	EasyLocalBackupSettingTab,
+} from "./settings";
 
-// Remember to rename these classes and interfaces!
+const PARTIAL_SUFFIX = ".partial";
 
-export default class MyPlugin extends Plugin {
-	settings!: MyPluginSettings;
+export default class EasyLocalBackupPlugin extends Plugin {
+	settings: EasyLocalBackupSettings;
+	private settingTab: EasyLocalBackupSettingTab;
+	private running = false;
 
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (_evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
+		this.addRibbonIcon("archive", "Create a local backup", () => {
+			void this.runBackup();
 		});
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			},
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (
-				editor: Editor,
-				_ctx: MarkdownView | MarkdownFileInfo,
-			) => {
-				editor.replaceSelection('Sample editor command');
-			},
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView =
-					this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			},
+			id: "backup-vault",
+			name: "Back up vault now",
+			callback: () => void this.runBackup(),
 		});
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(activeDocument, 'click', (_evt: MouseEvent) => {
-			new Notice('Click');
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(
-			window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000),
-		);
+		this.settingTab = new EasyLocalBackupSettingTab(this.app, this);
+		this.addSettingTab(this.settingTab);
 	}
 
-	onunload() {}
-
 	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<MyPluginSettings>,
-		);
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+
+	async runBackup(): Promise<void> {
+		if (this.running) {
+			new Notice("A backup is already running.");
+			return;
+		}
+
+		const adapter = this.app.vault.adapter;
+		if (!(adapter instanceof FileSystemAdapter)) {
+			new Notice("Easy Local Backup only works with a local, file-based vault.");
+			return;
+		}
+
+		const destRoot = this.settings.destination.trim();
+		if (!destRoot) {
+			new Notice("Choose a backup destination in the Easy Local Backup settings first.");
+			return;
+		}
+		if (!path.isAbsolute(destRoot)) {
+			new Notice("The backup destination must be an absolute path.");
+			return;
+		}
+
+		const source = path.resolve(adapter.getBasePath());
+		const destination = path.resolve(destRoot);
+		if (isInside(source, destination)) {
+			new Notice("The backup destination can't be inside the vault. Pick a folder outside it.");
+			return;
+		}
+
+		this.running = true;
+		const progress = new Notice("Backing up vault…", 0);
+		let partialPath: string | null = null;
+
+		try {
+			await fsp.mkdir(destination, { recursive: true });
+
+			const prefix = `${sanitize(this.app.vault.getName())}-backup-`;
+			await removeStalePartials(destination, prefix);
+
+			// Abort early, with a clear message, if the destination can't hold the backup.
+			const needed = await dirSize(source);
+			const free = await freeSpace(destination);
+			if (free !== null && free < needed) {
+				throw new Error(
+					`Not enough free space at the destination: the vault needs ${formatBytes(needed)} ` +
+						`but only ${formatBytes(free)} is free.`
+				);
+			}
+
+			const finalPath = await uniquePath(destination, `${prefix}${timestamp()}`);
+			partialPath = finalPath + PARTIAL_SUFFIX;
+
+			// 1. Copy everything into the .partial folder.
+			const skipped = await copyDir(source, partialPath);
+
+			// 2. Only now does the backup become visible under its real name.
+			await fsp.rename(partialPath, finalPath);
+			partialPath = null;
+
+			this.settings.lastBackup = Date.now();
+			this.settings.lastBackupName = path.basename(finalPath);
+			await this.saveSettings();
+			this.settingTab.renderLastBackup();
+
+			progress.hide();
+			new Notice(
+				`Backup complete: ${finalPath}` +
+					(skipped > 0 ? ` (${skipped} symlink/special item(s) skipped)` : ""),
+				8000
+			);
+		} catch (error) {
+			console.error("Easy Local Backup: backup failed", error);
+			progress.hide();
+			new Notice(`Backup failed: ${error instanceof Error ? error.message : String(error)}`, 10000);
+			if (partialPath) {
+				await fsp.rm(partialPath, { recursive: true, force: true }).catch(() => undefined);
+			}
+		} finally {
+			this.running = false;
+		}
+	}
 }
 
-class SampleModal extends Modal {
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.setText('Woah!');
-	}
+/** True if `child` is the same as, or located inside, `parent`. */
+function isInside(parent: string, child: string): boolean {
+	const rel = path.relative(parent, child);
+	if (rel === "") return true;
+	return rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
+}
 
-	onClose() {
-		const { contentEl } = this;
-		contentEl.empty();
+/** Makes a vault name safe to use inside a folder name on any OS. */
+function sanitize(name: string): string {
+	return name.replace(/[\\/:*?"<>|]/g, "_").trim() || "vault";
+}
+
+/** Local time as YYYY-MM-DD_HHmmss (no colons, so it is valid on Windows too). */
+function timestamp(): string {
+	const d = new Date();
+	const p = (n: number) => String(n).padStart(2, "0");
+	return (
+		`${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_` +
+		`${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+	);
+}
+
+async function exists(p: string): Promise<boolean> {
+	try {
+		await fsp.access(p);
+		return true;
+	} catch {
+		return false;
 	}
+}
+
+/** Returns dir/base, or dir/base-2, dir/base-3… if that name is already taken. */
+async function uniquePath(dir: string, base: string): Promise<string> {
+	let candidate = path.join(dir, base);
+	for (let i = 2; (await exists(candidate)) || (await exists(candidate + PARTIAL_SUFFIX)); i++) {
+		candidate = path.join(dir, `${base}-${i}`);
+	}
+	return candidate;
+}
+
+/** Deletes leftovers from backups that were interrupted (crash, power loss…). */
+async function removeStalePartials(dir: string, prefix: string): Promise<void> {
+	const entries = await fsp.readdir(dir, { withFileTypes: true });
+	for (const entry of entries) {
+		if (entry.isDirectory() && entry.name.startsWith(prefix) && entry.name.endsWith(PARTIAL_SUFFIX)) {
+			await fsp.rm(path.join(dir, entry.name), { recursive: true, force: true });
+		}
+	}
+}
+
+/** Total size in bytes of all regular files under dir (symlinks are ignored, as in copyDir). */
+async function dirSize(dir: string): Promise<number> {
+	let total = 0;
+	for (const entry of await fsp.readdir(dir, { withFileTypes: true })) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			total += await dirSize(full);
+		} else if (entry.isFile()) {
+			total += (await fsp.stat(full)).size;
+		}
+	}
+	return total;
+}
+
+/**
+ * Free bytes available to this user on the volume holding `dir`, or null if it
+ * can't be determined (fs.statfs needs Node 18.15+). In that case the check is skipped.
+ */
+async function freeSpace(dir: string): Promise<number | null> {
+	try {
+		const statfs = (fsp as any).statfs;
+		if (typeof statfs !== "function") return null;
+		const stats = await statfs.call(fsp, dir);
+		return Number(stats.bavail) * Number(stats.bsize);
+	} catch {
+		return null;
+	}
+}
+
+function formatBytes(bytes: number): string {
+	const units = ["B", "KB", "MB", "GB", "TB"];
+	let value = bytes;
+	let i = 0;
+	while (value >= 1024 && i < units.length - 1) {
+		value /= 1024;
+		i++;
+	}
+	return `${value.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+/**
+ * Recursively copies src into dest, preserving modification times.
+ * Returns the number of entries skipped (symlinks and other special files).
+ */
+async function copyDir(src: string, dest: string): Promise<number> {
+	await fsp.mkdir(dest, { recursive: true });
+	let skipped = 0;
+
+	for (const entry of await fsp.readdir(src, { withFileTypes: true })) {
+		const from = path.join(src, entry.name);
+		const to = path.join(dest, entry.name);
+
+		if (entry.isDirectory()) {
+			skipped += await copyDir(from, to);
+		} else if (entry.isFile()) {
+			await fsp.copyFile(from, to);
+			const stat = await fsp.stat(from);
+			await fsp.utimes(to, stat.atime, stat.mtime);
+		} else {
+			skipped++;
+		}
+	}
+	return skipped;
 }
