@@ -2,7 +2,7 @@
 	"id": "easy-local-backup",
 	"name": "Easy Local Backup",
 	"version": "1.0.0",
-	"minAppVersion": "0.15.0",
+	"minAppVersion": "1.1.0",
 	"description": "One-click backup of your vault to a local folder.",
 	"author": "JP",
 	"isDesktopOnly": true

@@ -42,12 +42,35 @@ export function validateDestination(destination: string, vaultPath: string | nul
 	return null;
 }
 
+interface ElectronLike {
+	remote?: {
+		dialog?: {
+			showOpenDialog(options: {
+				title?: string;
+				defaultPath?: string;
+				properties?: string[];
+			}): Promise<{ canceled: boolean; filePaths: string[] }>;
+		};
+	};
+	webUtils?: { getPathForFile(file: File): string };
+}
+
+function getElectron(): ElectronLike | null {
+	const nodeRequire = (window as unknown as { require?: (id: string) => unknown }).require;
+	if (typeof nodeRequire !== "function") return null;
+	try {
+		return nodeRequire("electron") as ElectronLike;
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Opens a native "choose folder" dialog and resolves with the chosen
  * absolute path, or null if the user cancelled.
  */
 async function pickFolder(defaultPath: string): Promise<string | null> {
-	const electron = (window as any).require?.("electron");
+	const electron = getElectron();
 
 	// Preferred: native Electron dialog.
 	const dialog = electron?.remote?.dialog;
@@ -57,14 +80,13 @@ async function pickFolder(defaultPath: string): Promise<string | null> {
 			defaultPath: defaultPath || undefined,
 			properties: ["openDirectory", "createDirectory"],
 		});
-		if (result.canceled || !result.filePaths?.length) return null;
-		return result.filePaths[0];
+		if (result.canceled || result.filePaths.length === 0) return null;
+		return result.filePaths[0] ?? null;
 	}
 
 	// Fallback: hidden <input webkitdirectory>. Works only for non-empty folders.
 	return new Promise<string | null>((resolve) => {
-		const input = document.createElement("input");
-		input.type = "file";
+		const input = createEl("input", { type: "file" });
 		input.webkitdirectory = true;
 		input.addEventListener("cancel", () => resolve(null));
 		input.addEventListener("change", () => {
@@ -74,8 +96,9 @@ async function pickFolder(defaultPath: string): Promise<string | null> {
 				return;
 			}
 
-			const absolute: string | undefined =
-				electron?.webUtils?.getPathForFile?.(file) ?? (file as any).path;
+			const absolute =
+				electron?.webUtils?.getPathForFile(file) ??
+				(file as unknown as { path?: string }).path;
 			if (!absolute) {
 				resolve(null);
 				return;
@@ -123,7 +146,7 @@ export class EasyLocalBackupSettingTab extends PluginSettingTab {
 						this.updateDestinationWarning();
 						await this.plugin.saveSettings();
 					});
-				text.inputEl.style.width = "280px";
+				text.inputEl.addClass("easy-local-backup-path-input");
 			})
 			.addButton((button) =>
 				button
@@ -145,8 +168,9 @@ export class EasyLocalBackupSettingTab extends PluginSettingTab {
 			);
 
 		// Inline warning shown under the description when the destination is invalid.
-		this.warningEl = destinationSetting.descEl.createDiv();
-		this.warningEl.style.color = "var(--text-error)";
+		this.warningEl = destinationSetting.descEl.createDiv({
+			cls: "easy-local-backup-warning",
+		});
 		this.updateDestinationWarning();
 
 		this.lastBackupSetting = new Setting(containerEl).setName("Last backup");
@@ -160,7 +184,7 @@ export class EasyLocalBackupSettingTab extends PluginSettingTab {
 			this.plugin.getVaultPath()
 		);
 		this.warningEl.setText(problem ? `⚠ ${problem}` : "");
-		this.warningEl.style.display = problem ? "" : "none";
+		this.warningEl.toggleClass("easy-local-backup-hidden", !problem);
 	}
 
 	/** Refreshes the "Last backup" line; also called by the plugin after each backup. */

@@ -39,7 +39,11 @@ export default class EasyLocalBackupPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.settings = Object.assign(
+			{},
+			DEFAULT_SETTINGS,
+			(await this.loadData()) as Partial<EasyLocalBackupSettings> | null
+		);
 	}
 
 	async saveSettings() {
@@ -60,13 +64,13 @@ export default class EasyLocalBackupPlugin extends Plugin {
 
 		const vaultPath = this.getVaultPath();
 		if (!vaultPath) {
-			new Notice("Easy Local Backup only works with a local, file-based vault.");
+			new Notice("This plugin only works with a local, file-based vault.");
 			return;
 		}
 
 		const destRoot = this.settings.destination.trim();
 		if (!destRoot) {
-			new Notice("Choose a backup destination in the Easy Local Backup settings first.");
+			new Notice("Choose a backup destination in the plugin settings first.");
 			return;
 		}
 		const problem = validateDestination(destRoot, vaultPath);
@@ -206,15 +210,23 @@ async function dirSize(dir: string, signal: AbortSignal): Promise<number> {
 	return total;
 }
 
+interface StatFsResult {
+	bavail: number | bigint;
+	bsize: number | bigint;
+}
+
 /**
  * Free bytes available to this user on the volume holding `dir`, or null if it
  * can't be determined (fs.statfs needs Node 18.15+). In that case the check is skipped.
  */
 async function freeSpace(dir: string): Promise<number | null> {
 	try {
-		const statfs = (fsp as any).statfs;
-		if (typeof statfs !== "function") return null;
-		const stats = await statfs.call(fsp, dir);
+		// Older @types/node versions don't declare statfs, so describe it ourselves.
+		const fsWithStatfs = fsp as unknown as {
+			statfs?: (path: string) => Promise<StatFsResult>;
+		};
+		if (typeof fsWithStatfs.statfs !== "function") return null;
+		const stats = await fsWithStatfs.statfs(dir);
 		return Number(stats.bavail) * Number(stats.bsize);
 	} catch {
 		return null;
